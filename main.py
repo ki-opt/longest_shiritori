@@ -8,7 +8,7 @@ import pyscipopt
 import numpy as np
 import pandas as pd
 
-IS_PREPROCESSING_ENABLED = True
+IS_PREPROCESSING_ENABLED = False
 
 class JapDictionary:
 	DAKUTEN_MAP = str.maketrans(
@@ -115,7 +115,6 @@ class UnionFind:
 	Union-Find (Disjoint Set Union) データ構造
 	グラフの連結成分を効率的に管理・判定
 	"""
-	
 	def __init__(self, n):
 		"""
 		初期化: n個の要素（0からn-1）を独立した集合として作成
@@ -173,7 +172,7 @@ class UnionFind:
 		self.num_components -= 1
 		return True
 	
-	def is_connected(self, x, y):
+	def is_connected(self, x, y) -> bool:
 		"""
 		要素xとyが同じ連結成分に属するか判定
 		
@@ -225,9 +224,11 @@ class Solver:
 		'''
 		'''
 		# 定数集合の作成
-		self.__f_ij = self.jap_dictionary.f_ij.copy()
-		self.__V = np.arange(self.__f_ij.shape[0])
-		self.__s, self.__t = int(0), int(0)
+		self.__f_ij = self.jap_dictionary.f_ij.copy()	# 頂点iから頂点jへの重み
+		self.__V = np.arange(self.__f_ij.shape[0])		# 頂点集合
+		#self.__V_sj = np.concatenate([arr, [99, 100]])
+		self.__s, self.__t = int(0), int(0)					# 開始,終了スーパー頂点
+		self.__V_star = []
 		# モデル定義
 		self.__model, self.__x_ij, self.__x_sj, self.__x_jt = \
 			self.__define_linear_base_problem()
@@ -244,8 +245,9 @@ class Solver:
 			z = self.__model.getObjVal()
 			# 変数値取得
 			x_ij, x_sj, x_jt = self.__get_solution()
-			# 解の連結性チェック 
-			if self.__check_solution_connectivity(x_ij, x_sj, x_jt):
+			# 解の連結性チェック
+			is_fully_connected = self.__check_solution_connectivity(x_ij, x_sj, x_jt)
+			if is_fully_connected:
 				if z_best < z:
 					z_best = z
 					x_best_ij, x_best_sj, x_best_jt = x_ij, x_sj, x_jt
@@ -253,19 +255,23 @@ class Solver:
 			else:
 				if z < z_best:
 					break
-				z_dash = self.__get_z_dash_obj_value(x_ij, x_sj, x_jt)
+				z_dash, V_star = self.__get_z_dash_obj_value(x_ij, x_sj, x_jt)
 				if z_best < z_dash:
 					z_best = z_dash
 					x_best_ij, x_best_sj, x_best_jt = x_ij, x_sj, x_jt
 				# 新しい制約条件を追加した問題の設定
 				self.__model, self.__x_ij, self.__x_sj, self.__x_jt = \
 					self.__define_linear_base_problem()
-				
-				###########self.__dfklj;adfklj;sadfjkl => 制約追加まだ
+				# V*の抽出
+				self.__V_star.append(V_star)
+				# 制約の追加
+				self.__add_constraint(k+1)
 				k += 1
 
 		# 得られた解からしりとりの構成
 		x_best_ij, x_best_sj, x_best_jt
+
+		return z_best
 
 	def __define_linear_base_problem(self):
 		'''
@@ -351,13 +357,11 @@ class Solver:
 		'''
 		'''
 		# 最初のひらがな
-		first_hiragana = -1
 		for j in self.__V:
 			if x_sj[self.__s,j] == 1:
 				first_hiragana = int(j)
 				break
 		# 最後のひらがな
-		last_hiragana = -1 
 		for j in self.__V:
 			if x_jt[j,self.__s] == 1:
 				last_hiragana = int(j)
@@ -375,10 +379,34 @@ class Solver:
 					check_node.add(j)
 				z_dash += x_ij[i,j]
 			idx_V_star += 1
-		input(z_dash)
+		#V_star.
+		print(z_dash)
 		input(V_star)
-		return z_dash
+		return z_dash, V_star
 
+	def __add_constraint(self, k):
+		'''
+		'''
+		for l in range(k):
+			V_minus_V_star = [i for i in self.__V if i not in self.__V_star[l]]
+			self.__model.addCons(
+				pyscipopt.quicksum(
+					self.__x_ij[i,j] for i in self.__V_star for j in V_minus_V_star
+				) >= 1
+			)
+
+	def __get_V_star(self, uf:UnionFind):
+		'''
+		'''
+		s_dash = len(self.__V)
+		t_dash = s_dash + 1
+		V_star = {s_dash, t_dash}
+		for i in self.__V:
+			if uf.is_connected(s_dash, i):
+				V_star.add(i)
+			if uf.is_connected(t_dash, i):
+				V_star.add(i)
+		return list(V_star)
 
 def main():
 	jap_dictionary = JapDictionary()

@@ -1,2 +1,4 @@
 data/*
+docs/*
+
 !data/.gitkeep
