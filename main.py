@@ -224,10 +224,10 @@ class Solver:
 		'''
 		'''
 		# 定数集合の作成
-		self.__f_ij = self.jap_dictionary.f_ij.copy()	# 頂点iから頂点jへの重み
-		self.__V = np.arange(self.__f_ij.shape[0])		# 頂点集合
-		#self.__V_sj = np.concatenate([arr, [99, 100]])
-		self.__s, self.__t = int(0), int(0)					# 開始,終了スーパー頂点
+		self.__f_ij = self.jap_dictionary.f_ij.copy()				# 頂点iから頂点jへの重み
+		self.__V = np.arange(self.__f_ij.shape[0])					# 頂点集合
+		self.__V_sj = np.concatenate([self.__V, [99, 100]])		# スーパー頂点含みの頂点集合
+		self.__s, self.__t = self.__V_sj[-2], self.__V_sj[-1]		# 開始,終了スーパー頂点
 		self.__V_star = []
 		# モデル定義
 		self.__model, self.__x_ij, self.__x_sj, self.__x_jt = \
@@ -283,14 +283,13 @@ class Solver:
 			(i, j): model.addVar(vtype='I', lb=0, ub=self.__f_ij[i,j])
 				for i in self.__V for j in self.__V
 		}
-		x_sj = {
-			(self.__s, j): model.addVar(vtype='C', lb=0, ub=1) for j in self.__V
-		}
-		x_jt = {
-			(j, self.__t): model.addVar(vtype='C', lb=0, ub=1) for j in self.__V
-		}
+		for j in self.__V:	# スーパー頂点
+			x_ij[(self.__s, j)] = model.addVar(vtype='I', lb=0, ub=1)
+			x_ij[(j, self.__t)] = model.addVar(vtype='I', lb=0, ub=1)
 		### 目的関数の作成
 		model.setObjective(
+			ここから
+
 			pyscipopt.quicksum(x_sj[self.__s,j] for j in self.__V) + 
 			pyscipopt.quicksum(x_ij[i,j] for i in self.__V for j in self.__V) + 
 			pyscipopt.quicksum(x_jt[j,self.__t] for j in self.__V),
