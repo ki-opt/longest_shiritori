@@ -5,10 +5,23 @@ trimmed_dictionaryには{ニントク/ジントク}は含まれない
 '''
 
 import pyscipopt
+import time
+import random as rd
 import numpy as np
 import pandas as pd
+from functools import wraps
 
 IS_PREPROCESSING_ENABLED = False
+
+def measure_time(func):
+	@wraps(func)
+	def wrapper(*args, **kwargs):
+		start = time.perf_counter()  # 高精度タイマー
+		result = func(*args, **kwargs)
+		end = time.perf_counter()
+		print(f"{func.__name__} took {end - start:.6f} seconds")
+		return result
+	return wrapper
 
 class JapDictionary:
 	DAKUTEN_MAP = str.maketrans(
@@ -218,20 +231,20 @@ class Solver:
 	def __init__(self, jap_dictionary: JapDictionary):
 		'''
 		'''
+		rd.seed(0)
 		self.jap_dictionary = jap_dictionary
 
+	@measure_time
 	def solve_by_lp_base_solver(self):
 		'''
 		'''
 		# 定数集合の作成
-		self.__f_ij = self.jap_dictionary.f_ij.copy()				# 頂点iから頂点jへの重み
-		self.__V = np.arange(self.__f_ij.shape[0])					# 頂点集合
-		self.__V_sj = np.concatenate([self.__V, [99, 100]])		# スーパー頂点含みの頂点集合
-		self.__s, self.__t = self.__V_sj[-2], self.__V_sj[-1]		# 開始,終了スーパー頂点
-		self.__V_star = []
+		self.__f_ij = self.jap_dictionary.f_ij.copy()	# 頂点iから頂点jへの重み
+		self.__V = np.arange(self.__f_ij.shape[0])		# 頂点集合
+		self.__s, self.__t = 99, 100							# 開始,終了スーパー頂点
+		self.__V_star_l = []
 		# モデル定義
-		self.__model, self.__x_ij, self.__x_sj, self.__x_jt = \
-			self.__define_linear_base_problem()
+		self.__model, self.__x_ij = self.__define_linear_base_problem()
 		# 線形緩和ベース分枝限定法
 		z_best = 0
 		k = 0
@@ -244,34 +257,65 @@ class Solver:
 			# 目的関数値取得
 			z = self.__model.getObjVal()
 			# 変数値取得
-			x_ij, x_sj, x_jt = self.__get_solution()
+			x_ij = self.__get_solution()
 			# 解の連結性チェック
-			is_fully_connected = self.__check_solution_connectivity(x_ij, x_sj, x_jt)
+			is_fully_connected = self.__check_solution_connectivity(x_ij)
 			if is_fully_connected:
 				if z_best < z:
 					z_best = z
-					x_best_ij, x_best_sj, x_best_jt = x_ij, x_sj, x_jt
+					x_best_ij = x_ij
 					break
 			else:
 				if z < z_best:
 					break
-				z_dash, V_star = self.__get_z_dash_obj_value(x_ij, x_sj, x_jt)
+				z_dash, V_star = self.__get_z_dash_obj_value(x_ij)
 				if z_best < z_dash:
 					z_best = z_dash
-					x_best_ij, x_best_sj, x_best_jt = x_ij, x_sj, x_jt
+					x_best_ij = x_ij
 				# 新しい制約条件を追加した問題の設定
-				self.__model, self.__x_ij, self.__x_sj, self.__x_jt = \
-					self.__define_linear_base_problem()
+				self.__model, self.__x_ij = self.__define_linear_base_problem()
 				# V*の抽出
-				self.__V_star.append(V_star)
-				# 制約の追加
+				self.__V_star_l.append(V_star)
+				# modelに制約の追加
 				self.__add_constraint(k+1)
 				k += 1
 
 		# 得られた解からしりとりの構成
-		x_best_ij, x_best_sj, x_best_jt
+		self.__get_shiritori(x_best_ij)
 
-		return z_best
+		return z_best - 2
+
+	@measure_time
+	def solve_by_construction(self):
+		'''
+		'''
+		V = np.arange(self.jap_dictionary.f_ij.shape[0])	# 頂点集合
+		shuffled_list = [i for i in range(len(V)-1)]			# 「ん」を除く
+		
+		z_best = 0
+		for _ in range(1000):
+			z = 1													
+			node = rd.randint(0,len(V)-2)						# 「ん」を除く乱数
+			f_ij = self.jap_dictionary.f_ij.copy()			# f_ijの設定
+			while(True):
+				rd.shuffle(shuffled_list)
+				is_found = False
+				for next_node in shuffled_list:
+					if f_ij[node][next_node] > 0:
+						z += 1
+						f_ij[node][next_node] -= 1
+						node = next_node
+						is_found = True
+						break
+				if not is_found:
+					break
+			# 「ん」に到達するものがあるかチェック
+			if f_ij[node][len(V)-1] > 0:
+				z += 1
+			if z > z_best:
+				z_best = z
+			print(f'{z_best}, {z}')
+		input('done')
 
 	def __define_linear_base_problem(self):
 		'''
@@ -284,30 +328,28 @@ class Solver:
 				for i in self.__V for j in self.__V
 		}
 		for j in self.__V:	# スーパー頂点
-			x_ij[(self.__s, j)] = model.addVar(vtype='I', lb=0, ub=1)
-			x_ij[(j, self.__t)] = model.addVar(vtype='I', lb=0, ub=1)
+			x_ij[(self.__s, j)] = model.addVar(vtype='I', lb=0, ub=1)	# ここ連続変数でも良いかも
+			x_ij[(j, self.__t)] = model.addVar(vtype='I', lb=0, ub=1)	# ここ連続変数でも良いかも
 		### 目的関数の作成
 		model.setObjective(
-			ここから
-
-			pyscipopt.quicksum(x_sj[self.__s,j] for j in self.__V) + 
-			pyscipopt.quicksum(x_ij[i,j] for i in self.__V for j in self.__V) + 
-			pyscipopt.quicksum(x_jt[j,self.__t] for j in self.__V),
+			pyscipopt.quicksum(x_ij[self.__s, j] for j in self.__V) +
+			pyscipopt.quicksum(x_ij[i, j] for i in self.__V for j in self.__V) +
+			pyscipopt.quicksum(x_ij[j, self.__t] for i in self.__V),
 			'maximize'
 		)
 		### 制約条件の作成
 		# s=>V上にフローを1流す
-		model.addCons(pyscipopt.quicksum(x_sj[self.__s,j] for j in self.__V) == 1)
+		model.addCons(pyscipopt.quicksum(x_ij[self.__s, j] for j in self.__V) == 1)
 		# s,t,V内での流量保存則
 		for i in self.__V:
 			model.addCons(
-				pyscipopt.quicksum(x_ij[i,j] for j in self.__V) + x_jt[i,self.__t] == 
-					pyscipopt.quicksum(x_ij[j,i] for j in self.__V) + x_sj[self.__s,i]
+				pyscipopt.quicksum(x_ij[i,j] for j in self.__V) + x_ij[i, self.__t] == 
+					pyscipopt.quicksum(x_ij[j,i] for j in self.__V) + x_ij[self.__s, i]
 			)
 		# V=>t上にフローを1流す
-		model.addCons(pyscipopt.quicksum(x_jt[j,self.__t] for j in self.__V) == 1)
+		model.addCons(pyscipopt.quicksum(x_ij[j, self.__t] for j in self.__V) == 1)
 
-		return model, x_ij, x_sj, x_jt
+		return model, x_ij
 
 	def __solve(self):
 		'''
@@ -316,22 +358,16 @@ class Solver:
 		self.__model.optimize()
 		return self.__model.getStatus()
 
-	def __get_solution(self) -> pd.DataFrame:
+	def __get_solution(self) -> dict:
 		'''
 		'''
-		x_ij_np = np.array([
-			[round(self.__model.getVal(self.__x_ij[i,j])) for j in self.__V] 
-				for i in self.__V
-		])
-		x_sj_np = np.array([
-			[round(self.__model.getVal(self.__x_sj[self.__s,j])) for j in self.__V]
-		])
-		x_jt_np = np.array([
-			[round(self.__model.getVal(self.__x_jt[j,self.__t]))] for j in self.__V
-		])
-		return x_ij_np, x_sj_np, x_jt_np
+		x_ij_dict = {
+			key: round(self.__model.getVal(self.__x_ij[key])) 
+	 			for key in self.__x_ij.keys()
+		}
+		return x_ij_dict
 
-	def __check_solution_connectivity(self, x_ij, x_sj, x_jt):
+	def __check_solution_connectivity(self, x_ij):
 		'''
 		'''
 		s_dash = len(self.__V)
@@ -342,58 +378,70 @@ class Solver:
 				if x_ij[i,j] > 0:
 					union_find.union(i,j)
 		for j in self.__V:
-			if x_sj[self.__s,j] > 0:
+			if x_ij[self.__s, j] > 0:
 				union_find.union(s_dash,j)
-			if x_jt[j,self.__t] > 0:
+			if x_ij[j, self.__t] > 0:
 				union_find.union(j,t_dash)
 		
 		# 連結判定
-		if union_find.is_fully_connected():
-			return True
-		return False
+		# エッジがあるノード（他のノードと同じ集合に属するもの）を抽出
+		non_isolated = [v for v in range(len(self.__V)+2) if union_find.get_size(v) > 1]
+		
+		if len(non_isolated) == 0:
+			return True  # 全部孤立ノードなら連結とみなす
+		
+		root = union_find.find(non_isolated[0])
+		return all(union_find.find(v) == root for v in non_isolated)
 
-	def __get_z_dash_obj_value(self, x_ij, x_sj, x_jt):
+	def __get_z_dash_obj_value(self, x_ij):
 		'''
 		'''
 		# 最初のひらがな
 		for j in self.__V:
-			if x_sj[self.__s,j] == 1:
+			if x_ij[self.__s, j] == 1:
 				first_hiragana = int(j)
 				break
 		# 最後のひらがな
 		for j in self.__V:
-			if x_jt[j,self.__s] == 1:
+			if x_ij[j, self.__t] == 1:
 				last_hiragana = int(j)
 				break
-		# z_star, V_starの算出
+
+		# z_star(目的関数値), V_star(始点,終点を含む頂点集合)の算出
 		z_dash = 2
-		idx_V_star = 0
+		idx = 0
 		V_star = [first_hiragana, last_hiragana]
 		check_node = {first_hiragana, last_hiragana}
-		while (idx_V_star < len(V_star)):
-			i = V_star[idx_V_star]
+		while (idx < len(V_star)):
+			i = V_star[idx]
 			for j in range(len(self.__V)):
 				if j not in check_node and x_ij[i,j] > 0:
 					V_star.append(j)
 					check_node.add(j)
 				z_dash += x_ij[i,j]
-			idx_V_star += 1
-		#V_star.
-		print(z_dash)
-		input(V_star)
+			idx += 1
+		# スーパーノード(始点,終点)の追加
+		V_star.append(self.__s)
+		V_star.append(self.__t)
 		return z_dash, V_star
 
 	def __add_constraint(self, k):
 		'''
 		'''
 		for l in range(k):
-			V_minus_V_star = [i for i in self.__V if i not in self.__V_star[l]]
+			V_minus_V_star = [i for i in self.__V if i not in self.__V_star_l[l]]
 			self.__model.addCons(
 				pyscipopt.quicksum(
-					self.__x_ij[i,j] for i in self.__V_star for j in V_minus_V_star
+					self.__x_ij[i,j] if i != self.__t else self.__x_ij[j,i] 
+						for i in self.__V_star_l[l] for j in V_minus_V_star
 				) >= 1
 			)
 
+	def __get_shiritori(self, x_best_ij):
+		'''
+		'''
+		pass
+	
 	def __get_V_star(self, uf:UnionFind):
 		'''
 		'''
@@ -418,6 +466,7 @@ def main():
 	jap_dictionary.create_graph()
 
 	solver = Solver(jap_dictionary)
+	solver.solve_by_construction()
 	solver.solve_by_lp_base_solver()
 
 if __name__ == '__main__':
