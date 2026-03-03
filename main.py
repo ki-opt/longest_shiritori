@@ -3,15 +3,18 @@ trimmed_dictionaryには{ニントク/ジントク}は含まれない
 最長しりとり問題の解法：https://ipsj.ixsq.nii.ac.jp/records/17223
 トリビアの種「広辞苑に載っている言葉で最も長くしりとりをすると最後の言葉は○○○」on 2024/3
 '''
-
-import pyscipopt
 import time
+import pyscipopt
 import random as rd
 import numpy as np
 import pandas as pd
 from functools import wraps
+from collections import defaultdict
+
+rd.seed(0)
 
 IS_PREPROCESSING_ENABLED = False
+NUM_OF_TARGET_WORDS = [1000,5000,10000,30000,50000]
 
 def measure_time(func):
 	@wraps(func)
@@ -57,6 +60,8 @@ class JapDictionary:
 		'''
 		self.dictionary: pd.DataFrame
 		self.f_ij: np.array
+		self.f_part_ij: dict
+		self.word_list: list
 
 	def read_katarigusa(self):
 		'''
@@ -110,6 +115,48 @@ class JapDictionary:
 		f_ij = np.zeros((len(self.KATAKANA_DICT),len(self.KATAKANA_DICT)), dtype=int)
 		np.add.at(f_ij,(i_indices.values,j_indices.values),1)
 		self.f_ij = f_ij
+
+	def create_tango_dict(self):
+		'''
+		'''
+		i_indices = self.dictionary['first_char'].map(self.KATAKANA_DICT).astype(int)
+		j_indices = self.dictionary['last_char'].map(self.KATAKANA_DICT).astype(int)
+		word_list = [[[] for _ in range(len(self.KATAKANA_DICT))] for _ in range(len(self.KATAKANA_DICT))]
+		for idx in range(len(i_indices)):
+			i, j = i_indices[idx], j_indices[idx]
+			word = self.dictionary.loc[idx,'lemma']
+			word_list[i][j].append(word)
+		self.word_list = word_list
+
+	def create_partially_graph(self):
+		'''
+		'''
+		rows = len(self.f_ij)
+		cols = len(self.f_ij[0])
+
+		# 1次元に展開
+		flat = []
+		coords = []
+
+		for i in range(rows):
+			for j in range(cols):
+					weight = self.f_ij[i][j]
+					if weight > 0:
+						flat.append(weight)
+						coords.append((i, j))
+	
+		self.f_part_ij = {i:None for i in NUM_OF_TARGET_WORDS}
+		for num in self.f_part_ij.keys():
+			# 重み付きで num 個抽出（重複あり）
+			picked = rd.choices(coords, weights=flat, k=num)
+
+			# 結果用のゼロ配列を作る
+			self.f_part_ij[num] = [[0]*cols for _ in range(rows)]
+
+			for i, j in picked:
+				self.f_part_ij[num][i][j] += 1
+		
+		self.f_part_ij.update({sum(sum(row) for row in self.f_ij):self.f_ij.copy()})
 
 	def save_trimmed_dictionary(self):
 		'''
@@ -231,20 +278,21 @@ class Solver:
 	def __init__(self, jap_dictionary: JapDictionary):
 		'''
 		'''
-		rd.seed(0)
 		self.jap_dictionary = jap_dictionary
+		self.__V = np.arange(self.jap_dictionary.f_ij.shape[0])	# 頂点集合
 
 	@measure_time
-	def solve_by_lp_base_solver(self):
+	def solve_by_lp_base_solver(self, given_f_ij=None):
 		'''
 		'''
+		if given_f_ij is None:
+			given_f_ij = self.jap_dictionary.f_ij.copy()
+
 		# 定数集合の作成
-		self.__f_ij = self.jap_dictionary.f_ij.copy()	# 頂点iから頂点jへの重み
-		self.__V = np.arange(self.__f_ij.shape[0])		# 頂点集合
 		self.__s, self.__t = 99, 100							# 開始,終了スーパー頂点
 		self.__V_star_l = []
 		# モデル定義
-		self.__model, self.__x_ij = self.__define_linear_base_problem()
+		self.__model, self.__x_ij = self.__define_linear_base_problem(given_f_ij)
 		# 線形緩和ベース分枝限定法
 		z_best = 0
 		k = 0
@@ -257,74 +305,127 @@ class Solver:
 			# 目的関数値取得
 			z = self.__model.getObjVal()
 			# 変数値取得
-			x_ij = self.__get_solution()
+			x_ij_dict = self.__get_solution()
 			# 解の連結性チェック
-			is_fully_connected = self.__check_solution_connectivity(x_ij)
+			is_fully_connected = self.__check_solution_connectivity(x_ij_dict)
 			if is_fully_connected:
 				if z_best < z:
 					z_best = z
-					x_best_ij = x_ij
+					x_best_ij_dict = x_ij_dict
 					break
 			else:
 				if z < z_best:
 					break
-				z_dash, V_star = self.__get_z_dash_obj_value(x_ij)
+				z_dash, V_star = self.__get_z_dash_obj_value_and_V_star(x_ij_dict)
 				if z_best < z_dash:
 					z_best = z_dash
-					x_best_ij = x_ij
+					x_best_ij_dict = x_ij_dict
 				# 新しい制約条件を追加した問題の設定
-				self.__model, self.__x_ij = self.__define_linear_base_problem()
+				self.__model, self.__x_ij = self.__define_linear_base_problem(given_f_ij)
 				# V*の抽出
 				self.__V_star_l.append(V_star)
 				# modelに制約の追加
 				self.__add_constraint(k+1)
 				k += 1
 
-		# 得られた解からしりとりの構成
-		self.__get_shiritori(x_best_ij)
+		# dictからnp.arrayへ変更
+		first_node, last_node, x_best_ij = self.__transform_x_ij_dict_to_x_ij_np(x_best_ij_dict)
 
-		return z_best - 2
+		return first_node, last_node, x_best_ij, z_best - 2
 
 	@measure_time
-	def solve_by_construction(self):
+	def solve_by_construction(self, given_f_ij=None):
 		'''
 		'''
-		V = np.arange(self.jap_dictionary.f_ij.shape[0])	# 頂点集合
-		shuffled_list = [i for i in range(len(V)-1)]			# 「ん」を除く
-		
+		if given_f_ij is None:
+			given_f_ij = self.jap_dictionary.f_ij.copy()			
+
+		shuffled_list = [i for i in range(len(self.__V)-1)]		# 「ん」を除く
 		z_best = 0
-		for _ in range(1000):
-			z = 1													
-			node = rd.randint(0,len(V)-2)						# 「ん」を除く乱数
-			f_ij = self.jap_dictionary.f_ij.copy()			# f_ijの設定
+		for _ in range(100):
+			z = 0
+			node = rd.randint(0,len(self.__V)-2)						# 「ん」を除く乱数, randint=[0,10] => (0<=x<=10の乱数)
+			first_node = node
+			x_ij_list = []
+			f_ij = given_f_ij.copy()						# f_ijの設定
 			while(True):
 				rd.shuffle(shuffled_list)
 				is_found = False
 				for next_node in shuffled_list:
 					if f_ij[node][next_node] > 0:
 						z += 1
+						x_ij_list.append((node,next_node))
 						f_ij[node][next_node] -= 1
 						node = next_node
+						last_node = node
 						is_found = True
 						break
 				if not is_found:
 					break
 			# 「ん」に到達するものがあるかチェック
-			if f_ij[node][len(V)-1] > 0:
+			if f_ij[node][len(self.__V)-1] > 0:
+				last_node = len(self.__V)-1
+				x_ij_list.append((node,len(self.__V)-1))
 				z += 1
+			# 最適値の更新
 			if z > z_best:
+				first_best_node = first_node
+				last_best_node = last_node
+				x_best_ij_list = x_ij_list.copy()
 				z_best = z
-			print(f'{z_best}, {z}')
-		input('done')
+								
+		# dict形式に変換(線形計画法ベースに合わせるため)
+		x_best_ij_dict = defaultdict(int)
+		for i in range(0,len(x_best_ij_list),1):
+			x_best_ij_dict[x_best_ij_list[i]] += 1
+		x_best_ij_dict[(99,first_best_node)] = 1
+		x_best_ij_dict[(last_best_node,100)] = 1
 
-	def __define_linear_base_problem(self):
+		# dictからnp.arrayへ変更
+		first_node, last_node, x_best_ij = self.__transform_x_ij_dict_to_x_ij_np(x_best_ij_dict)
+
+		return first_node, last_node, x_best_ij, z_best, x_best_ij_list
+
+	def reconstruction_shiritori(self,
+		first_node, 
+		last_node,
+		x_ij
+	):
+		'''
+		'''
+		x_ij = x_ij.copy()
+		stack = [first_node]
+		trail = []
+		while stack:
+			u = stack[-1]
+			# 未使用の辺を探す
+			is_found = False
+			for v in range(len(self.__V)):
+				if x_ij[u, v] > 0:
+					x_ij[u, v] -= 1
+					stack.append(v)
+					is_found = True
+					break  # 1辺だけ進む
+			
+			if not is_found:
+				# 行き詰まったらtrailに追加
+				trail.append(stack.pop())
+
+		trail.reverse()
+
+		#print(first_node, last_node)
+		#input(trail)
+		num = len(self.jap_dictionary.word_list[trail[-2]][trail[-1]])
+		return self.jap_dictionary.word_list[trail[-2]][trail[-1]][rd.randint(0,num)-1]
+		
+	def __define_linear_base_problem(self, given_f_ij:np.array):
 		'''
 		'''
 		### モデルの作成
 		model = pyscipopt.Model('longest_shiritori')
 		### 変数の作成
 		x_ij = {
-			(i, j): model.addVar(vtype='I', lb=0, ub=self.__f_ij[i,j])
+			(i, j): model.addVar(vtype='I', lb=0, ub=given_f_ij[i][j])
 				for i in self.__V for j in self.__V
 		}
 		for j in self.__V:	# スーパー頂点
@@ -355,6 +456,7 @@ class Solver:
 		'''
 		'''
 		### 求解
+		self.__model.hideOutput()
 		self.__model.optimize()
 		return self.__model.getStatus()
 
@@ -393,7 +495,7 @@ class Solver:
 		root = union_find.find(non_isolated[0])
 		return all(union_find.find(v) == root for v in non_isolated)
 
-	def __get_z_dash_obj_value(self, x_ij):
+	def __get_z_dash_obj_value_and_V_star(self, x_ij):
 		'''
 		'''
 		# 最初のひらがな
@@ -437,11 +539,21 @@ class Solver:
 				) >= 1
 			)
 
-	def __get_shiritori(self, x_best_ij):
+	def __transform_x_ij_dict_to_x_ij_np(self, x_best_ij_dict):
 		'''
 		'''
-		pass
-	
+		x_ij = np.zeros_like(self.jap_dictionary.f_ij)
+		for key, value in x_best_ij_dict.items():
+			if value == 0: 
+				continue
+			if key[0] == 99:
+				first_node = key[1]
+			elif key[1] == 100:
+				last_node = key[0]
+			else:
+				x_ij[key[0],key[1]] = value
+		return first_node, last_node, x_ij
+
 	def __get_V_star(self, uf:UnionFind):
 		'''
 		'''
@@ -464,10 +576,20 @@ def main():
 	else:
 		jap_dictionary.read_trimmed_katarigusa()
 	jap_dictionary.create_graph()
+	jap_dictionary.create_tango_dict()
+	jap_dictionary.create_partially_graph()
 
-	solver = Solver(jap_dictionary)
-	solver.solve_by_construction()
-	solver.solve_by_lp_base_solver()
+	for num in jap_dictionary.f_part_ij.keys():
+		solver = Solver(jap_dictionary)
+		first_node, last_node, x_best_ij, z_best = solver.solve_by_lp_base_solver(jap_dictionary.f_part_ij[num])
+		last_word = solver.reconstruction_shiritori(first_node, last_node, x_best_ij)
+		print(z_best, last_word)
+	
+	for num in jap_dictionary.f_part_ij.keys():
+		solver = Solver(jap_dictionary)
+		first_node, last_node, x_best_ij, z_best, x_best_ij_list = solver.solve_by_construction(jap_dictionary.f_part_ij[num])
+		last_word = solver.reconstruction_shiritori(first_node, last_node, x_best_ij)
+		print(z_best, last_word)
 
 if __name__ == '__main__':
 	main()
